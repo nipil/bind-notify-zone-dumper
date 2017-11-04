@@ -221,8 +221,11 @@ class StdinReaderThread(MessageReaderThread):
             logging.debug("Eventmask {1} on file descriptor {0}".format(fd, eventmask))
             if eventmask & (select.POLLIN | select.POLLPRI):
                 self.read_messages()
+            elif eventmask & select.POLLHUP:
+                logging.info("Exiting due to HUP on STDIN (end of pipe)")
+                self.request_termination.set()
             else:
-                raise Exception("Error while polling from journal (event_mask={0})".format(eventmask))
+                raise Exception("Error while polling from STDIN (event_mask={0})".format(eventmask))
 
 class FileReaderThread(MessageReaderThread):
 
