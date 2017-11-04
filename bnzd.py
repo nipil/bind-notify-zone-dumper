@@ -2,6 +2,7 @@
 
 import dns.query
 import dns.zone
+import fcntl
 import logging
 import os.path
 import queue
@@ -25,14 +26,20 @@ class ZoneInfo:
 
     # increasing serial filtering
     LATEST_ZONE_INFO={}
+    LATEST_ZONE_INFO_LOCK=threading.Lock()
 
     @classmethod
     def get_latest(cls, zone):
-        return cls.LATEST_ZONE_INFO.get(zone, None)
+        cls.LATEST_ZONE_INFO_LOCK.acquire()
+        value = cls.LATEST_ZONE_INFO.get(zone, None)
+        cls.LATEST_ZONE_INFO_LOCK.release()
+        return value
 
     @classmethod
     def set_latest(cls, zone, serial):
+        cls.LATEST_ZONE_INFO_LOCK.acquire()
         cls.LATEST_ZONE_INFO[zone] = serial
+        cls.LATEST_ZONE_INFO_LOCK.release()
 
     @classmethod
     def factory(cls, message):
@@ -290,19 +297,33 @@ class StdinReaderThread(MessageReaderThread):
 
     def __init__(self, request_termination, out_queue):
         super().__init__(request_termination, out_queue)
+        stdin_fd = sys.stdin.fileno()
         # Create a poll object and register journal events on journal fd
         self.poller = select.poll()
-        self.poller.register(sys.stdin, select.POLLIN | select.POLLPRI | select.POLLRDNORM | select.POLLRDBAND)
+        self.poller.register(stdin_fd, select.POLLIN | select.POLLPRI | select.POLLRDNORM | select.POLLRDBAND)
+        # set stdin to non blocking
+        stdin_flags = fcntl.fcntl(stdin_fd, fcntl.F_GETFL)
+        fcntl.fcntl(stdin_fd, fcntl.F_SETFL, stdin_flags | os.O_NONBLOCK)
+        # manage incomplete lines
+        self.incomplete_line = ""
 
     def read_messages(self):
-        # get message and handle EOF
-        try:
-            message = input()
-        except EOFError as e:
-            logging.info("Exiting due to EOF on STDIN (Ctrl-D)")
-            sys.exit(0)
-        # process message
-        self.process_message(message)
+        first = True
+        for message in sys.stdin.readlines():
+            if message.endswith('\n'):
+                message = message.rstrip('\n')
+                # reintegrate previous incomplete lines
+                if first:
+                    logging.debug("Reintegrate previously unfinished line : {0}".format(self.incomplete_line))
+                    first = False
+                    message = self.incomplete_line + message
+                    self.incomplete_line = ""
+                logging.debug("Complete line : {0}".format(message))
+                self.process_message(message)
+            else:
+                logging.debug("Incomplete line added to buffer : {0}".format(message))
+                self.incomplete_line += message
+                logging.debug("Incomplete line buffer contains : {0}".format(self.incomplete_line))
 
     def run_step(self):
         events = self.poller.poll(self.get_default_timeout_ms())
@@ -385,6 +406,7 @@ class ZoneTransferThread(TransformingThread):
             zone_info = self.in_queue.get(True, self.get_default_timeout_sec())
         except queue.Empty as e:
             return
+        logging.info("Transfering zone {0} (expecting serial {1})".format(zone_info.name, zone_info.serial))
         # does a zone transfer and update object
         try:
             if zone_info.update(self.server, None):
