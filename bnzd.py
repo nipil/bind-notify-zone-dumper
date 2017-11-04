@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import logging
+import os.path
 import queue
 import re
 import select
@@ -8,6 +9,7 @@ import sys
 import threading
 import time
 import traceback
+
 from systemd import journal
 
 class ZoneInfo:
@@ -35,7 +37,7 @@ class ZoneInfo:
         # test serial
         latest = cls.LATEST_ZONE_INFO.get(zone, None)
         if latest is not None and serial <= latest:
-            logging.info("Discarding notify message for zone {0} with serial {1} (not newer than serial {2})".format(zone, serial, latest))
+            logging.info("Discarding notify message for zone {0} with serial {1} (not newer than latest serial {2})".format(zone, serial, latest))
             return None
         cls.LATEST_ZONE_INFO[zone] = serial
         # build and return
@@ -58,12 +60,16 @@ class BaseThread(threading.Thread):
     DEFAULT_POLLING_TIMEOUT_MS=None
 
     @classmethod
-    def set_default_timeout(cls, timeout_ms):
+    def set_default_timeout_ms(cls, timeout_ms):
         cls.DEFAULT_POLLING_TIMEOUT_MS = timeout_ms
 
     @classmethod
-    def get_default_timeout(cls):
+    def get_default_timeout_ms(cls):
         return cls.DEFAULT_POLLING_TIMEOUT_MS
+
+    @classmethod
+    def get_default_timeout_sec(cls):
+        return cls.DEFAULT_POLLING_TIMEOUT_MS / 1000
 
     def __init__(self, request_termination, in_queue, out_queue):
         # name
@@ -183,7 +189,7 @@ class JournalReaderThread(MessageReaderThread):
         logging.debug("Processed {0} journal entries".format(count_message))
 
     def run_step(self):
-        events = self.poller.poll(self.get_default_timeout())
+        events = self.poller.poll(self.get_default_timeout_ms())
         for fd, eventmask in events:
             logging.debug("Eventmask {1} on file descriptor {0}".format(fd, eventmask))
             if eventmask & (select.POLLIN | select.POLLPRI):
@@ -210,13 +216,67 @@ class StdinReaderThread(MessageReaderThread):
         self.process_message(message)
 
     def run_step(self):
-        events = self.poller.poll(self.get_default_timeout())
+        events = self.poller.poll(self.get_default_timeout_ms())
         for fd, eventmask in events:
             logging.debug("Eventmask {1} on file descriptor {0}".format(fd, eventmask))
             if eventmask & (select.POLLIN | select.POLLPRI):
                 self.read_messages()
             else:
                 raise Exception("Error while polling from journal (event_mask={0})".format(eventmask))
+
+class FileReaderThread(MessageReaderThread):
+
+    def __init__(self, request_termination, out_queue, file_path, error_notification_interval_seconds=60):
+        super().__init__(request_termination, out_queue)
+        self.previous_file_length = None
+        self.file_path = os.path.expanduser(file_path)
+        self.next_error_notification_time = None
+        self.error_notification_interval_seconds = error_notification_interval_seconds
+
+    def read_messages(self, file_obj):
+        # fetch end and read file size
+        file_size = file_obj.seek(0, 2)
+        # if first run, only get file length
+        if self.previous_file_length is None:
+            self.previous_file_length = file_size
+            logging.info("Starting watching file '{0}' at offset {1}".format(self.file_path, self.previous_file_length))
+            return
+        # if size did not change, consider it's the same content
+        if self.previous_file_length == file_size:
+            logging.debug("File size of '{0}' is {1} and did not change since last poll".format(self.file_path, self.previous_file_length))
+            return
+        # if size decreased, truncation occured
+        if self.previous_file_length > file_size:
+            logging.info("File size of '{0}' decreased from {1} to {2}, restarting (truncation detected)".format(self.file_path, self.previous_file_length, file_size))
+            self.previous_file_length = 0
+        # if size increased, there is new content
+        if self.previous_file_length < file_size:
+            logging.debug("File size of '{0}' increased from {1} to {2} ({3} new bytes)".format(self.file_path, self.previous_file_length, file_size, file_size - self.previous_file_length))
+        # go to previous position and read everything
+        file_obj.seek(self.previous_file_length)
+        # read a potential line
+        line = file_obj.readline()
+        while line:
+            if line.endswith('\n'):
+                logging.debug("Complete line '{0}'".format(line))
+                self.process_message(line.rstrip('\n'))
+                self.previous_file_length = file_obj.tell()
+                line = file_obj.readline()
+            else:
+                logging.debug("Unfinished line '{0}'".format(line))
+                file_obj.seek(self.previous_file_length)
+                break
+
+    def run_step(self):
+        time.sleep(self.get_default_timeout_sec())
+        try:
+            with open(self.file_path) as file_obj:
+                self.read_messages(file_obj)
+        except OSError as e:
+            current_time = time.time()
+            if self.next_error_notification_time is None or self.next_error_notification_time < current_time:
+                logging.error("{0}: {1}".format(e.__class__.__name__, e))
+                self.next_error_notification_time = current_time + self.error_notification_interval_seconds
 
 if __name__ == '__main__':
 
@@ -226,8 +286,9 @@ if __name__ == '__main__':
         # analyze commande line arguments
         parser = argparse.ArgumentParser(description="Bind9 notify zone dumper")
         parser.add_argument("-j", "--journald", metavar="SPEC", type=str, nargs="*", help="read from journald unit")
+        parser.add_argument("-f", "--file", metavar="FILE", type=str, help="read from file")
         parser.add_argument("-l", "--log-level", metavar="LVL", choices=["critical", "error", "warning", "info", "debug"], default="warning")
-        parser.add_argument("-p", "--polling", metavar="MS", type=int, help="polling interval in milliseconds", default=250)
+        parser.add_argument("-p", "--polling", metavar="MS", type=int, help="polling interval in milliseconds", default=1000)
         args = parser.parse_args()
 
         # configure logging
@@ -235,8 +296,13 @@ if __name__ == '__main__':
         logging.basicConfig(format='%(asctime)s %(threadName)s %(levelname)s %(message)s', level=numeric_level)
         logging.debug("Command line arguments: {0}".format(args))
 
+        # check mutually exclusive settings
+        if args.file is not None and args.journald is not None:
+            logging.error("Cannot use journald input and file input at the same time")
+            sys.exit(1)
+
         # define default polling timeout
-        BaseThread.set_default_timeout(args.polling)
+        BaseThread.set_default_timeout_ms(args.polling)
 
         # global exit flag
         request_termination = threading.Event()
@@ -248,6 +314,9 @@ if __name__ == '__main__':
         if args.journald is not None:
             logging.info("Reading from systemd journal")
             reader_thread = JournalReaderThread(request_termination, log_queue, args.journald)
+        elif args.file is not None:
+            logging.info("Reading from file '{0}'".format(args.file))
+            reader_thread = FileReaderThread(request_termination, log_queue, args.file)
         else:
             logging.info("Reading from standard input (stdin)")
             reader_thread = StdinReaderThread(request_termination, log_queue)
@@ -255,7 +324,7 @@ if __name__ == '__main__':
         # create working threads
         with reader_thread:
             try:
-                while not request_termination.wait(args.polling / 1000):
+                while not request_termination.wait(BaseThread.get_default_timeout_ms()):
                     pass
             except KeyboardInterrupt as e:
                 logging.warning("Exiting due to keyboard interrupt (Ctrl-C = SIGINT)")
