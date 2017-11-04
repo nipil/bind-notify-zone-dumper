@@ -278,6 +278,16 @@ class FileReaderThread(MessageReaderThread):
                 logging.error("{0}: {1}".format(e.__class__.__name__, e))
                 self.next_error_notification_time = current_time + self.error_notification_interval_seconds
 
+
+class ZoneTransferThread(BaseThread):
+
+    def __init__(self, request_termination, in_queue, out_queue):
+        super().__init__(request_termination, in_queue, out_queue)
+
+    def run_step(self):
+        time.sleep(self.get_default_timeout_sec())
+        logging.debug("Iteration...")
+
 if __name__ == '__main__':
 
     import argparse
@@ -289,6 +299,7 @@ if __name__ == '__main__':
         parser.add_argument("-f", "--file", metavar="FILE", type=str, help="read from file")
         parser.add_argument("-l", "--log-level", metavar="LVL", choices=["critical", "error", "warning", "info", "debug"], default="warning")
         parser.add_argument("-p", "--polling", metavar="MS", type=int, help="polling interval in milliseconds", default=1000)
+        parser.add_argument("-z", "--zone-threads", metavar="R", type=int, help="number of zone transfer threads", default=1)
         args = parser.parse_args()
 
         # configure logging
@@ -308,30 +319,38 @@ if __name__ == '__main__':
         request_termination = threading.Event()
 
         # input message queue
-        log_queue = queue.Queue()
+        zone_info_queue = queue.Queue()
+        zone_data_queue = queue.Queue()
 
         # select input
         if args.journald is not None:
             logging.info("Reading from systemd journal")
-            reader_thread = JournalReaderThread(request_termination, log_queue, args.journald)
+            reader_thread = JournalReaderThread(request_termination, zone_info_queue, args.journald)
         elif args.file is not None:
             logging.info("Reading from file '{0}'".format(args.file))
-            reader_thread = FileReaderThread(request_termination, log_queue, args.file)
+            reader_thread = FileReaderThread(request_termination, zone_info_queue, args.file)
         else:
             logging.info("Reading from standard input (stdin)")
-            reader_thread = StdinReaderThread(request_termination, log_queue)
+            reader_thread = StdinReaderThread(request_termination, zone_info_queue)
 
         # create working threads
-        with reader_thread:
-            try:
-                while not request_termination.wait(BaseThread.get_default_timeout_ms()):
-                    pass
-            except KeyboardInterrupt as e:
-                logging.warning("Exiting due to keyboard interrupt (Ctrl-C = SIGINT)")
+        ztt_pool = ThreadPool(ZoneTransferThread, request_termination, zone_info_queue, zone_data_queue, args.zone_threads)
+
+        # start/stop threads and enter main loop
+        with ztt_pool:
+            with reader_thread:
+                try:
+                    while not request_termination.wait(BaseThread.get_default_timeout_ms()):
+                        pass
+                except KeyboardInterrupt as e:
+                    logging.warning("Exiting due to keyboard interrupt (Ctrl-C = SIGINT)")
+
+        # clean exit
+        sys.exit(0)
 
     except SystemExit as e:
         message = "Exiting with return code {0}".format(e.code)
-        if e == 0:
+        if e.code == 0:
             logging.info(message)
         else:
             logging.warn(message)
