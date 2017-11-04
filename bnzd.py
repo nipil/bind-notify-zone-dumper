@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 
+import base64
+import binascii
 import dns.query
+import dns.tsig
+import dns.tsigkeyring
 import dns.zone
 import fcntl
 import logging
@@ -16,6 +20,55 @@ import traceback
 from systemd import journal
 
 
+class Tsig:
+
+    RE_NAME = r"^[-.A-Z0-9a-z]+$"
+
+    def __init__(self, key_file):
+        # load input
+        self.key_file = os.path.expanduser(key_file)
+        with open(self.key_file) as file_obj:
+            key_name = file_obj.readline().rstrip('\n')
+            key_secret_base64 = file_obj.readline().rstrip('\n')
+            key_algo = file_obj.readline().rstrip('\n')
+
+        # key name
+        if len(key_name) == 0:
+            raise Exception("Key name in key file '{0}' used for TSIG cannot be empty".format(self.key_file))
+        if not re.fullmatch(self.RE_NAME, key_name):
+            raise Exception("Invalid key name in key file '{0}'".format(self.key_file))
+        self.key_name = key_name
+
+        # key secret (base64 encoded)
+        if len(key_secret_base64) == 0:
+            raise Exception("Key secret in key file '{0}' used for TSIG cannot be empty".format(self.key_file))
+        try:
+            base64.b64decode(key_secret_base64, None, validate=True)
+        except binascii.Error as e:
+            raise Exception("Invalid base64 in secret in key file '{0}' used for TSIG".format(self.key_file))
+        self.key_secret_base64 = key_secret_base64
+
+        # key algo
+        self.key_algo = getattr(dns.tsig, key_algo, None)
+        if self.key_algo is None:
+            raise Exception("Invalid algorithm {1} in key file '{0}' used for TSIG".format(self.key_file, key_algo))
+        # actually load the dictionary
+        self.key_ring = dns.tsigkeyring.from_text({
+            self.key_name: self.key_secret_base64
+        })
+
+        logging.debug("{0}: name={1} secret={2} algo={3}".format(self.__class__.__name__, self.key_name, self.key_secret_base64, self.key_algo))
+
+    def get_keyring(self):
+        return self.key_ring
+
+    def get_name(self):
+        return self.key_name
+
+    def get_algo(self):
+        return self.key_algo
+
+
 class ZoneInfo:
 
     # message filter information
@@ -27,6 +80,23 @@ class ZoneInfo:
     # increasing serial filtering
     LATEST_ZONE_INFO={}
     LATEST_ZONE_INFO_LOCK=threading.Lock()
+
+    # TSIG
+    TSIG = None
+    TSIG_LOCK=threading.Lock()
+
+    @classmethod
+    def set_tsig(cls, tsig):
+        cls.TSIG_LOCK.acquire()
+        cls.TSIG = tsig
+        cls.TSIG_LOCK.release()
+
+    @classmethod
+    def get_tsig(cls):
+        cls.TSIG_LOCK.acquire()
+        value = cls.TSIG
+        cls.TSIG_LOCK.release()
+        return value
 
     @classmethod
     def get_latest(cls, zone):
@@ -75,7 +145,7 @@ class ZoneInfo:
 
     def update(self, server, key):
         # prepare query, returns a generator
-        dns_query = dns.query.xfr(server, self.name)
+        dns_query = dns.query.xfr(server, self.name, keyring=self.get_tsig().get_keyring(), keyname=self.get_tsig().get_name(), keyalgorithm=self.get_tsig().get_algo())
         # transform the result, this triggering the request
         dns_zone = dns.zone.from_xfr(dns_query)
         # IMPORTANT: zone origin has a final . in its name !
@@ -414,7 +484,9 @@ class ZoneTransferThread(TransformingThread):
         except dns.exception.DNSException as e:
             # No answer or RRset not for qname
             logging.error("Problem while doing zone transfer for '{0}': {1}".format(zone_info.name, e))
-            return
+            # enhanced debugging output
+            if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
+                traceback.print_exc(file=sys.stdout)
 
 
 class ZoneWriterThread(ConsumingThread):
@@ -447,7 +519,7 @@ if __name__ == '__main__':
         parser.add_argument("-f", "--file", metavar="FILE", type=str, help="read from file")
         parser.add_argument("-l", "--log-level", metavar="LVL", choices=["critical", "error", "warning", "info", "debug"], default="warning")
         parser.add_argument("-p", "--polling", metavar="MS", type=int, help="polling interval in milliseconds", default=1000)
-        parser.add_argument("-k", "--xfer-key", metavar="KEY", type=int, help="number of zone transfer threads", default=1)
+        parser.add_argument("-k", "--key", metavar="KEY", type=str, help="key file to use for TSIG")
         parser.add_argument("-z", "--zone-threads", metavar="N", type=int, help="number of zone transfer threads", default=1)
         parser.add_argument("-s", "--server", metavar="HOST", type=str, help="dns server to transfer zones from", default="localhost")
         parser.add_argument("-d", "--destination", metavar="DST", type=str, help="folder where zone data are stored", default="zones")
@@ -458,6 +530,10 @@ if __name__ == '__main__':
         numeric_level = getattr(logging, args.log_level.upper())
         logging.basicConfig(format='%(asctime)s %(threadName)s %(levelname)s %(message)s', level=numeric_level)
         logging.debug("Command line arguments: {0}".format(args))
+
+        # load key for tsig
+        if args.key:
+            ZoneInfo.set_tsig(Tsig(args.key))
 
         # check mutually exclusive settings
         if args.file is not None and args.journald is not None:
