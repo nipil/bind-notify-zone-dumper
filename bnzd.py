@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+import dns.query
+import dns.zone
 import logging
 import os.path
 import queue
@@ -11,6 +13,7 @@ import time
 import traceback
 
 from systemd import journal
+
 
 class ZoneInfo:
 
@@ -24,6 +27,14 @@ class ZoneInfo:
     LATEST_ZONE_INFO={}
 
     @classmethod
+    def get_latest(cls, zone):
+        return cls.LATEST_ZONE_INFO.get(zone, None)
+
+    @classmethod
+    def set_latest(cls, zone, serial):
+        cls.LATEST_ZONE_INFO[zone] = serial
+
+    @classmethod
     def factory(cls, message):
         # filter and keep only notify message
         m = cls.RE_NOTIFY.fullmatch(message)
@@ -35,11 +46,12 @@ class ZoneInfo:
         dnssec = len(m.group(2)) > 0
         serial = int(m.group(3))
         # test serial
-        latest = cls.LATEST_ZONE_INFO.get(zone, None)
+        latest = cls.get_latest(zone)
         if latest is not None and serial <= latest:
             logging.info("Discarding notify message for zone {0} with serial {1} (not newer than latest serial {2})".format(zone, serial, latest))
             return None
-        cls.LATEST_ZONE_INFO[zone] = serial
+        # store requested serial
+        cls.set_latest(zone, serial)
         # build and return
         zone_info = cls(zone, serial, dnssec)
         logging.info("Detected notification for zone {0} with serial {1}, with DNSSEC={2}".format(zone, serial, dnssec))
@@ -49,9 +61,39 @@ class ZoneInfo:
         self.name = name
         self.serial = serial
         self.dnssec = dnssec
+        self.data = None
 
     def __repr__(self):
         return "ZoneInfo: name={0} serial={1} dnssec={2}".format(self.name, self.serial, self.dnssec)
+
+    def update(self, server, key):
+        # prepare query, returns a generator
+        dns_query = dns.query.xfr(server, self.name)
+        # transform the result, this triggering the request
+        dns_zone = dns.zone.from_xfr(dns_query)
+        # IMPORTANT: zone origin has a final . in its name !
+        logging.debug("Zone origin: {0}".format(dns_zone.origin))
+        # check soa records (there can be more than one)
+        soa_rrset = dns_zone.find_rdataset("@", dns.rdatatype.SOA)
+        if len(soa_rrset) == 0:
+            logging.warn("No SOA record found for zone {0}, skipping".format(dns_zone.origin))
+            return False
+        # we use the first soa record to get serial
+        serial = soa_rrset[0].serial
+        logging.debug("Serial of fetched zone {0} is {1}".format(dns_zone.origin, serial))
+        # get latest requested
+        latest = self.get_latest(self.name)
+        if latest:
+            logging.debug("Latest serial for zone {0} is {1}".format(self.name, latest))
+            if serial < latest:
+                logging.warn("Ignoring fetched zone, as its serial {0} is older than latest known/requested {1}".format(serial, latest))
+                return False
+        # possibly update zone serial
+        self.serial = serial
+        # store zone content
+        self.data = dns_zone.to_text()
+        return True
+
 
 class BaseThread(threading.Thread):
 
@@ -71,7 +113,7 @@ class BaseThread(threading.Thread):
     def get_default_timeout_sec(cls):
         return cls.DEFAULT_POLLING_TIMEOUT_MS / 1000
 
-    def __init__(self, request_termination, in_queue, out_queue):
+    def __init__(self, request_termination):
         # name
         self.__class__.COUNTER += 1
         super().__init__(name="{0}-{1}".format(self.__class__.__name__, self.__class__.COUNTER))
@@ -79,13 +121,11 @@ class BaseThread(threading.Thread):
         self.request_termination = request_termination
         if self.request_termination is None:
             self.request_termination = threading.Event()
-        # processing
-        self.in_queue = in_queue
-        self.out_queue = out_queue
 
     def run(self):
         try:
             while not self.request_termination.is_set():
+                # logging.debug("Iteration...")
                 self.run_step()
         except Exception as e:
             logging.critical("{0}: {1}".format(e.__class__.__name__, e))
@@ -107,22 +147,43 @@ class BaseThread(threading.Thread):
         logging.debug("Thread {0} finished.".format(self.name))
 
     def run_step(self):
-        raise NotImplementedError("{0} must implement run_step (of {1})".format(self.__class__.__name__, BaseThread.__name__))
+        raise NotImplementedError("{0} must implement run_step (of {1})".format(self.__class__.__name__, TransformingThread.__name__))
+
+
+class TransformingThread(BaseThread):
+
+    def __init__(self, request_termination, in_queue, out_queue):
+        super().__init__(request_termination)
+        self.in_queue = in_queue
+        self.out_queue = out_queue
+
+
+class ProducingThread(BaseThread):
+
+    def __init__(self, request_termination, out_queue):
+        super().__init__(request_termination)
+        self.out_queue = out_queue
+
+
+class ConsumingThread(BaseThread):
+
+    def __init__(self, request_termination, in_queue):
+        super().__init__(request_termination)
+        self.in_queue = in_queue
+
 
 class ThreadPool:
 
-    def __init__(self, cls, request_termination, in_queue, out_queue, max_thread_count):
+    def __init__(self, cls, max_thread_count, request_termination, *args, **kwargs):
+        # class of the threads to create
         self.cls = cls
         # signaling
         self.request_termination = request_termination
         if self.request_termination is None:
             self.request_termination = threading.Event()
-        # processing
-        self.in_queue = in_queue
-        self.out_queue = out_queue
         self.max_thread_count = max_thread_count
         # threads
-        self.threads = [ cls(self.request_termination, self.in_queue, self.out_queue) for i in range(self.max_thread_count) ]
+        self.threads = [ cls(self.request_termination, *args, **kwargs) for i in range(self.max_thread_count) ]
 
     def __enter__(self):
         logging.debug("Starting pool of {0} {1}".format(self.max_thread_count, self.cls.__name__))
@@ -140,10 +201,33 @@ class ThreadPool:
             thread.join()
         logging.debug("Threads {0} finished".format([ t.name for t in self.threads]))
 
-class MessageReaderThread(BaseThread):
+
+class TransformingThreadPool(ThreadPool):
+
+    def __init__(self, cls, max_thread_count, request_termination, in_queue, out_queue, *args, **kwargs):
+        super().__init__(cls, max_thread_count, request_termination, in_queue, out_queue, *args, **kwargs)
+        self.in_queue = in_queue
+        self.out_queue = out_queue
+
+
+class ProducingThreadPool(ThreadPool):
+
+    def __init__(self, cls, max_thread_count, request_termination, out_queue, *args, **kwargs):
+        super().__init__(cls, max_thread_count, request_termination, out_queue, *args, **kwargs)
+        self.out_queue = out_queue
+
+
+class ConsumingThreadPool(ThreadPool):
+
+    def __init__(self, cls, max_thread_count, request_termination, in_queue, *args, **kwargs):
+        super().__init__(cls, max_thread_count, request_termination, in_queue, *args, **kwargs)
+        self.in_queue = in_queue
+
+
+class MessageReaderThread(ProducingThread):
 
     def __init__(self, request_termination, out_queue):
-        super().__init__(request_termination, None, out_queue)
+        super().__init__(request_termination, out_queue)
 
     def process_message(self, message):
         # only queue notify messages
@@ -151,13 +235,17 @@ class MessageReaderThread(BaseThread):
         if zone_info:
             self.out_queue.put(zone_info)
 
+
 class JournalReaderThread(MessageReaderThread):
 
     def __init__(self, request_termination, out_queue, filters):
         super().__init__(request_termination, out_queue)
+
         logging.debug("Journal filters: {0}".format(filters))
         self.journal = journal.Reader()
         logging.debug("Journal file descriptor is {0}".format(self.journal.fileno()))
+        self.journal_events = self.journal.get_events()
+        logging.debug("Using eventmask={0} for journal".format(self.journal_events))
         # add filters
         for filt in filters:
             try:
@@ -170,7 +258,7 @@ class JournalReaderThread(MessageReaderThread):
         self.journal.get_previous()
         # Create a poll object and register journal events on journal fd
         self.poller = select.poll()
-        self.poller.register(self.journal.fileno(), self.journal.get_events())
+        self.poller.register(self.journal.fileno(), self.journal_events)
 
     def read_messages(self):
         # Process events and reset the readable state of the file descriptor returned by .fileno()
@@ -192,10 +280,11 @@ class JournalReaderThread(MessageReaderThread):
         events = self.poller.poll(self.get_default_timeout_ms())
         for fd, eventmask in events:
             logging.debug("Eventmask {1} on file descriptor {0}".format(fd, eventmask))
-            if eventmask & (select.POLLIN | select.POLLPRI):
+            if eventmask & self.journal_events:
                 self.read_messages()
             else:
                 raise Exception("Error while polling from journal (event_mask={0})".format(eventmask))
+
 
 class StdinReaderThread(MessageReaderThread):
 
@@ -203,7 +292,7 @@ class StdinReaderThread(MessageReaderThread):
         super().__init__(request_termination, out_queue)
         # Create a poll object and register journal events on journal fd
         self.poller = select.poll()
-        self.poller.register(sys.stdin, select.POLLIN | select.POLLPRI)
+        self.poller.register(sys.stdin, select.POLLIN | select.POLLPRI | select.POLLRDNORM | select.POLLRDBAND)
 
     def read_messages(self):
         # get message and handle EOF
@@ -227,13 +316,15 @@ class StdinReaderThread(MessageReaderThread):
             else:
                 raise Exception("Error while polling from STDIN (event_mask={0})".format(eventmask))
 
+
 class FileReaderThread(MessageReaderThread):
 
-    def __init__(self, request_termination, out_queue, file_path, error_notification_interval_seconds=60):
+    def __init__(self, request_termination, out_queue, file_path, error_notification_interval_seconds):
         super().__init__(request_termination, out_queue)
         self.previous_file_length = None
         self.file_path = os.path.expanduser(file_path)
         self.next_error_notification_time = None
+        logging.info("Only one file-related error per {0} seconds will be reported".format(error_notification_interval_seconds))
         self.error_notification_interval_seconds = error_notification_interval_seconds
 
     def read_messages(self, file_obj):
@@ -282,14 +373,46 @@ class FileReaderThread(MessageReaderThread):
                 self.next_error_notification_time = current_time + self.error_notification_interval_seconds
 
 
-class ZoneTransferThread(BaseThread):
+class ZoneTransferThread(TransformingThread):
 
-    def __init__(self, request_termination, in_queue, out_queue):
+    def __init__(self, request_termination, in_queue, out_queue, server):
         super().__init__(request_termination, in_queue, out_queue)
+        self.server = server
 
     def run_step(self):
-        time.sleep(self.get_default_timeout_sec())
-        logging.debug("Iteration...")
+        # get an item to process
+        try:
+            zone_info = self.in_queue.get(True, self.get_default_timeout_sec())
+        except queue.Empty as e:
+            return
+        # does a zone transfer and update object
+        try:
+            if zone_info.update(self.server, None):
+                self.out_queue.put(zone_info)
+        except dns.exception.DNSException as e:
+            # No answer or RRset not for qname
+            logging.error("Problem while doing zone transfer for '{0}': {1}".format(zone_info.name, e))
+            return
+
+
+class ZoneWriterThread(ConsumingThread):
+
+    def __init__(self, request_termination, in_queue, output_dir_path):
+        super().__init__(request_termination, in_queue)
+        self.output_dir_path = os.path.expanduser(output_dir_path)
+
+    def store(self, zone_info):
+        logging.debug("Archiving {0} to directory '{1}'".format(zone_info, self.output_dir_path))
+
+    def run_step(self):
+        # get an item to process
+        try:
+            zone_info = self.in_queue.get(True, self.get_default_timeout_sec())
+        except queue.Empty as e:
+            return
+        # save zone in archives
+        self.store(zone_info)
+
 
 if __name__ == '__main__':
 
@@ -302,7 +425,11 @@ if __name__ == '__main__':
         parser.add_argument("-f", "--file", metavar="FILE", type=str, help="read from file")
         parser.add_argument("-l", "--log-level", metavar="LVL", choices=["critical", "error", "warning", "info", "debug"], default="warning")
         parser.add_argument("-p", "--polling", metavar="MS", type=int, help="polling interval in milliseconds", default=1000)
-        parser.add_argument("-z", "--zone-threads", metavar="R", type=int, help="number of zone transfer threads", default=1)
+        parser.add_argument("-k", "--xfer-key", metavar="KEY", type=int, help="number of zone transfer threads", default=1)
+        parser.add_argument("-z", "--zone-threads", metavar="N", type=int, help="number of zone transfer threads", default=1)
+        parser.add_argument("-s", "--server", metavar="HOST", type=str, help="dns server to transfer zones from", default="localhost")
+        parser.add_argument("-d", "--destination", metavar="DST", type=str, help="folder where zone data are stored", default="zones")
+
         args = parser.parse_args()
 
         # configure logging
@@ -336,17 +463,21 @@ if __name__ == '__main__':
             logging.info("Reading from standard input (stdin)")
             reader_thread = StdinReaderThread(request_termination, zone_info_queue)
 
-        # create working threads
-        ztt_pool = ThreadPool(ZoneTransferThread, request_termination, zone_info_queue, zone_data_queue, args.zone_threads)
+        # create writer thread
+        writer = ZoneWriterThread(request_termination, zone_data_queue, args.destination)
+
+        # create dns threads
+        ztt_pool = TransformingThreadPool(ZoneTransferThread, args.zone_threads, request_termination, zone_info_queue, zone_data_queue, args.server)
 
         # start/stop threads and enter main loop
-        with ztt_pool:
-            with reader_thread:
-                try:
-                    while not request_termination.wait(BaseThread.get_default_timeout_ms()):
-                        pass
-                except KeyboardInterrupt as e:
-                    logging.warning("Exiting due to keyboard interrupt (Ctrl-C = SIGINT)")
+        with writer:
+            with ztt_pool:
+                with reader_thread:
+                    try:
+                        while not request_termination.wait(BaseThread.get_default_timeout_ms()):
+                            pass
+                    except KeyboardInterrupt as e:
+                        logging.warning("Exiting due to keyboard interrupt (Ctrl-C = SIGINT)")
 
         # clean exit
         sys.exit(0)
