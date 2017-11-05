@@ -12,6 +12,7 @@ import os.path
 import queue
 import re
 import select
+import subprocess
 import sys
 import threading
 import time
@@ -139,6 +140,7 @@ class ZoneInfo:
         self.serial = serial
         self.dnssec = dnssec
         self.data = None
+        self.saved_file_path = None
 
     def __repr__(self):
         return "ZoneInfo: name={0} serial={1} dnssec={2}".format(self.name, self.serial, self.dnssec)
@@ -175,6 +177,14 @@ class ZoneInfo:
         self.data = dns_zone.to_text()
         return True
 
+    def get_data(self):
+        return self.data
+
+    def get_saved_file_path(self):
+        return self.saved_file_path
+
+    def set_saved_file_path(self, file_path):
+        self.saved_file_path = file_path
 
 class BaseThread(threading.Thread):
 
@@ -493,10 +503,10 @@ class ZoneTransferThread(TransformingThread):
                 traceback.print_exc(file=sys.stdout)
 
 
-class ZoneWriterThread(ConsumingThread):
+class ZoneWriterThread(TransformingThread):
 
-    def __init__(self, request_termination, in_queue, output_dir_path):
-        super().__init__(request_termination, in_queue)
+    def __init__(self, request_termination, in_queue, out_queue, output_dir_path):
+        super().__init__(request_termination, in_queue, out_queue)
         self.output_dir_path = os.path.expanduser(output_dir_path)
 
     def store(self, zone_info):
@@ -505,7 +515,8 @@ class ZoneWriterThread(ConsumingThread):
         logging.info("Saving '{0}'".format(target_file))
         os.makedirs(target_directory, exist_ok=True)
         with open(target_file, 'wb') as file_obj:
-            file_obj.write(zone_info.data)
+            file_obj.write(zone_info.get_data())
+        zone_info.set_saved_file_path(target_file)
 
     def run_step(self):
         # get an item to process
@@ -515,6 +526,49 @@ class ZoneWriterThread(ConsumingThread):
             return
         # save zone in archives
         self.store(zone_info)
+        # forward
+        self.out_queue.put(zone_info)
+
+class PostProcessingThread(ConsumingThread):
+
+    def __init__(self, request_termination, in_queue, external_command, external_timeout, external_mute):
+        super().__init__(request_termination, in_queue)
+        self.external_command = external_command
+        self.external_timeout = external_timeout
+        self.external_mute = external_mute
+
+    def run_command(self, zone_info):
+        # input/output
+        if self.external_mute:
+            stream = subprocess.DEVNULL
+        else:
+            stream = None
+        # exec
+        command = "{0} {1} {2} {3}".format(self.external_command, zone_info.get_saved_file_path(), zone_info.name, zone_info.serial)
+        logging.debug("Running command with timeout {0} : {1}".format(self.external_timeout, command))
+        result = subprocess.run(command, timeout=self.external_timeout, shell=True, stdin=stream, stdout=stream, stderr=stream)
+        # result
+        message = "Post-processing command returned with code {0}".format(result.returncode)
+        if result.returncode == 0:
+            logging.info(message)
+        else:
+            logging.warn(message)
+
+    def run_step(self):
+        # get an item to process
+        try:
+            zone_info = self.in_queue.get(True, self.get_default_timeout_sec())
+        except queue.Empty as e:
+            return
+        # run post-process if requested
+        if self.external_command:
+            try:
+                self.run_command(zone_info)
+            except subprocess.SubprocessError as e:
+                logging.error("{0}: {1}".format(e.__class__.__name__, e))
+                # enhanced debugging output
+                if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
+                    traceback.print_exc(file=sys.stdout)
 
 
 if __name__ == '__main__':
@@ -530,6 +584,10 @@ if __name__ == '__main__':
         parser.add_argument("-p", "--polling", metavar="MS", type=int, help="polling interval in milliseconds", default=1000)
         parser.add_argument("-k", "--key", metavar="KEY", type=str, help="key file to use for TSIG")
         parser.add_argument("-z", "--zone-threads", metavar="N", type=int, help="number of zone transfer threads", default=1)
+        parser.add_argument("-e", "--external-threads", metavar="M", type=int, help="number of threads for external post-processing", default=1)
+        parser.add_argument("-c", "--external-command", metavar="CMD", type=str, help="program to run after a zone has been processed")
+        parser.add_argument("-t", "--external-timeout", metavar="SEC", type=int, help="timeout after which the external command is killed (in seconds)", default=10)
+        parser.add_argument("-m", "--external-mute", action="store_true", help="shut stdin/stdout/sterr of external command")
         parser.add_argument("-s", "--server", metavar="HOST", type=str, help="dns server to transfer zones from", default="localhost")
         parser.add_argument("-d", "--destination", metavar="DST", type=str, help="folder where zone data are stored", default="zones")
 
@@ -556,35 +614,37 @@ if __name__ == '__main__':
         request_termination = threading.Event()
 
         # input message queue
-        zone_info_queue = queue.Queue()
-        zone_data_queue = queue.Queue()
+        producer_queue = queue.Queue()
+        transfer_queue = queue.Queue()
+        postprocess_queue = queue.Queue()
 
         # select input
         if args.journald is not None:
             logging.info("Reading from systemd journal")
-            reader_thread = JournalReaderThread(request_termination, zone_info_queue, args.journald)
+            reader_thread = JournalReaderThread(request_termination, producer_queue, args.journald)
         elif args.file is not None:
             logging.info("Reading from file '{0}'".format(args.file))
-            reader_thread = FileReaderThread(request_termination, zone_info_queue, args.file)
+            reader_thread = FileReaderThread(request_termination, producer_queue, args.file)
         else:
             logging.info("Reading from standard input (stdin)")
-            reader_thread = StdinReaderThread(request_termination, zone_info_queue)
-
-        # create writer thread
-        writer = ZoneWriterThread(request_termination, zone_data_queue, args.destination)
+            reader_thread = StdinReaderThread(request_termination, producer_queue)
 
         # create dns threads
-        ztt_pool = TransformingThreadPool(ZoneTransferThread, args.zone_threads, request_termination, zone_info_queue, zone_data_queue, args.server)
+        ztt_pool = TransformingThreadPool(ZoneTransferThread, args.zone_threads, request_termination, producer_queue, transfer_queue, args.server)
 
-        # start/stop threads and enter main loop
-        with writer:
-            with ztt_pool:
-                with reader_thread:
-                    try:
-                        while not request_termination.wait(BaseThread.get_default_timeout_ms()):
-                            pass
-                    except KeyboardInterrupt as e:
-                        logging.warning("Exiting due to keyboard interrupt (Ctrl-C = SIGINT)")
+        # create writer thread
+        writer = ZoneWriterThread(request_termination, transfer_queue, postprocess_queue, args.destination)
+
+        # create post-processor threads
+        ppt_pool = ConsumingThreadPool(PostProcessingThread, args.external_threads, request_termination, postprocess_queue, args.external_command, args.external_timeout, args.external_mute)
+
+        # start/stop threads
+        with ppt_pool, writer, ztt_pool, reader_thread:
+            try:
+                while not request_termination.wait(BaseThread.get_default_timeout_ms()):
+                    pass
+            except KeyboardInterrupt as e:
+                logging.warning("Exiting due to keyboard interrupt (Ctrl-C = SIGINT)")
 
         # clean exit
         sys.exit(0)
