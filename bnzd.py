@@ -490,8 +490,10 @@ class ZoneTransferThread(TransformingThread):
             zone_info = self.in_queue.get(True, self.get_default_timeout_sec())
         except queue.Empty as e:
             return
-        logging.info("Transfering zone {0} (expecting serial {1})".format(zone_info.name, zone_info.serial))
+        # mark item as done
+        self.in_queue.task_done()
         # does a zone transfer and update object
+        logging.info("Transfering zone {0} and expecting serial {1}".format(zone_info.name, zone_info.serial))
         try:
             if zone_info.update(self.server, None):
                 self.out_queue.put(zone_info)
@@ -524,6 +526,8 @@ class ZoneWriterThread(TransformingThread):
             zone_info = self.in_queue.get(True, self.get_default_timeout_sec())
         except queue.Empty as e:
             return
+        # mark item as done
+        self.in_queue.task_done()
         # save zone in archives
         self.store(zone_info)
         # forward
@@ -560,6 +564,8 @@ class PostProcessingThread(ConsumingThread):
             zone_info = self.in_queue.get(True, self.get_default_timeout_sec())
         except queue.Empty as e:
             return
+        # mark item as done
+        self.in_queue.task_done()
         # run post-process if requested
         if self.external_command:
             try:
@@ -645,6 +651,9 @@ if __name__ == '__main__':
                     pass
             except KeyboardInterrupt as e:
                 logging.warning("Exiting due to keyboard interrupt (Ctrl-C = SIGINT)")
+
+        # input message queue
+        logging.info("Tasks left in queues : {0} notifications, {1} transfers and {2} saves were discarded".format(producer_queue.qsize(), transfer_queue.qsize(), postprocess_queue.qsize()))
 
         # clean exit
         sys.exit(0)
