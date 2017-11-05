@@ -179,7 +179,7 @@ If not already done, create an unpriviledged system user and allow him to read j
     useradd --system ${BNZD_USER}
     gpasswd -a bnzd systemd-journal
 
-Then, as root, create an unpriviledged user and its working space :
+Then, as root, create its working space :
 
     mkdir ${BNZD_DATA}
     git -C ${BNZD_DATA} init
