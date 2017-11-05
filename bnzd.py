@@ -500,7 +500,12 @@ class ZoneWriterThread(ConsumingThread):
         self.output_dir_path = os.path.expanduser(output_dir_path)
 
     def store(self, zone_info):
-        logging.debug("Archiving {0} to directory '{1}'".format(zone_info, self.output_dir_path))
+        target_directory = os.path.join(self.output_dir_path, zone_info.name)
+        target_file = os.path.join(target_directory, str(zone_info.serial))
+        logging.info("Saving '{0}'".format(target_file))
+        os.makedirs(target_directory, exist_ok=True)
+        with open(target_file, 'wb') as file_obj:
+            file_obj.write(zone_info.data)
 
     def run_step(self):
         # get an item to process
