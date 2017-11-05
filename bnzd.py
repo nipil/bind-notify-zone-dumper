@@ -580,7 +580,28 @@ class PostProcessingThread(ConsumingThread):
 if __name__ == '__main__':
 
     import argparse
+    import signal
 
+    # global exit flag
+    request_termination = threading.Event()
+
+    # signal handler
+    def handler(signum, frame):
+        logging.info("Receiving signal {0}, requesting exit...".format(signum))
+        request_termination.set()
+
+    # Hangup detected on controlling terminal or death of controlling process
+    signal.signal(signal.SIGHUP, handler)
+    # Kill signal
+    signal.signal(signal.SIGUSR1, handler)
+    # User-defined signal 2
+    signal.signal(signal.SIGUSR2, handler)
+    # Broken pipe: write to pipe with no readers
+    signal.signal(signal.SIGPIPE, handler)
+    # Termination signal
+    signal.signal(signal.SIGTERM, handler)
+
+    # parse arguments
     try:
         # analyze commande line arguments
         parser = argparse.ArgumentParser(description="Bind9 notify zone dumper")
@@ -615,9 +636,6 @@ if __name__ == '__main__':
 
         # define default polling timeout
         BaseThread.set_default_timeout_ms(args.polling)
-
-        # global exit flag
-        request_termination = threading.Event()
 
         # input message queue
         producer_queue = queue.Queue()
