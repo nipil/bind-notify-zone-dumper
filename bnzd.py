@@ -144,8 +144,12 @@ class ZoneInfo:
         return "ZoneInfo: name={0} serial={1} dnssec={2}".format(self.name, self.serial, self.dnssec)
 
     def update(self, server, key):
+        tsig=self.get_tsig()
         # prepare query, returns a generator
-        dns_query = dns.query.xfr(server, self.name, keyring=self.get_tsig().get_keyring(), keyname=self.get_tsig().get_name(), keyalgorithm=self.get_tsig().get_algo())
+        if tsig:
+            dns_query = dns.query.xfr(server, self.name, keyring=tsig.get_keyring(), keyname=tsig.get_name(), keyalgorithm=tsig.get_algo())
+        else:
+            dns_query = dns.query.xfr(server, self.name)
         # transform the result, this triggering the request
         dns_zone = dns.zone.from_xfr(dns_query)
         # IMPORTANT: zone origin has a final . in its name !
