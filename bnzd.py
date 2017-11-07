@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import base64
 import binascii
 import dns.query
@@ -8,10 +9,12 @@ import dns.tsigkeyring
 import dns.zone
 import fcntl
 import logging
+import logging.handlers
 import os.path
 import queue
 import re
 import select
+import signal
 import subprocess
 import sys
 import threading
@@ -588,9 +591,6 @@ class PostProcessingThread(ConsumingThread):
 
 if __name__ == '__main__':
 
-    import argparse
-    import signal
-
     # global exit flag
     request_termination = threading.Event()
 
@@ -626,12 +626,34 @@ if __name__ == '__main__':
         parser.add_argument("-m", "--external-mute", action="store_true", help="shut stdin/stdout/sterr of external command")
         parser.add_argument("-s", "--server", metavar="HOST", type=str, help="dns server to transfer zones from", default="localhost")
         parser.add_argument("-d", "--destination", metavar="DST", type=str, help="folder where zone data are stored", default="zones")
+        parser.add_argument("--syslog", type=str, nargs="?", help="log to syslog instead of stdout", const="/dev/log")
 
         args = parser.parse_args()
 
         # configure logging
+        logger = logging.getLogger()
         numeric_level = getattr(logging, args.log_level.upper())
-        logging.basicConfig(format='%(asctime)s %(threadName)s %(levelname)s %(message)s', level=numeric_level)
+        logger.setLevel(numeric_level)
+        log_format = "%(message)s"
+        # enhance logging when debugging
+        if numeric_level == logging.DEBUG:
+            log_format = "thread=%(threadName)s module=%(module)s func=%(funcName)s line=%(lineno)d {0}".format(log_format)
+        # switch between syslog and standard stdout
+        if args.syslog is not None:
+            # handle either networked or unix socket syslog
+            if re.fullmatch(r"^[^:]+:\d+$", args.syslog):
+                host, port = args.syslog.split(":") # host:udpport
+                address = (host, int(port))
+            else:
+                address = args.syslog # /path/to/socket
+            handler = logging.handlers.SysLogHandler(address=address)
+        else:
+            handler = logging.StreamHandler()
+            log_format = "%(asctime)s %(levelname)s {0}".format(log_format)
+        formatter = logging.Formatter(log_format)
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+
         logging.debug("Command line arguments: {0}".format(args))
 
         # load key for tsig

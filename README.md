@@ -20,12 +20,27 @@ Whenever a bind9 zone notification is detected in the source feed, fetch zone co
 
     usage: bnzd.py [-h] [-j [SPEC [SPEC ...]]] [-f FILE] [-l LVL]
                    [-p MS] [-k KEY] [-z N] [-s HOST] [-d DST]
-                   [-e M] [-c CMD] [-t SEC] [-m]
+                   [-e M] [-c CMD] [-t SEC] [-m] [--syslog [TARGET]]
 
     Bind9 notify zone dumper
 
     optional arguments:
         -h, --help            show this help message and exit
+
+        -l LVL
+        --log-level LVL
+            default logging level (debug, info, warn, error...)
+            defaults to "warn"
+            if "debug", each message is prefixed with additionnal info
+
+        --syslog [TARGET]
+            logs to syslog instead of stderr
+            TARGET defaults to '/dev/log' (syslog's unix socket input)
+            set TARGET to hostname:udpport to log on a networked syslog
+
+        --server HOST
+            dns server to transfer zones from
+            Default: localhost
 
         -s HOST
         --server HOST
@@ -219,7 +234,7 @@ Install a systemd service unit (remove `-k` if you do not use it) :
     User=${BNZD_USER}
     Group=${BNZD_USER}
     Restart=on-failure
-    ExecStart=${BNZD_BIN}/venv/bin/python3 ${BNZD_BIN}/bnzd.py -d ${BNZD_DATA} -l info -j _SYSTEMD_UNIT=bind9.service -k ${BNZD_DATA}/tsig.key -m -c ${BNZD_BIN}/tools/git-commit-hook.sh
+    ExecStart=${BNZD_BIN}/venv/bin/python3 ${BNZD_BIN}/bnzd.py -d ${BNZD_DATA} -l info --syslog -j _SYSTEMD_UNIT=bind9.service -k ${BNZD_DATA}/tsig.key -m -c ${BNZD_BIN}/tools/git-commit-hook.sh
 
     [Install]
     WantedBy=multi-user.target
