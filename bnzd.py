@@ -641,8 +641,8 @@ if __name__ == '__main__':
         # switch between syslog and standard stdout
         if args.syslog is not None:
             # handle either networked or unix socket syslog
-            if re.fullmatch(r"^[^:]+:\d+$", args.syslog):
-                host, port = args.syslog.split(":") # host:udpport
+            if re.fullmatch(r"^[^@]+@\d+$", args.syslog):
+                host, port = args.syslog.split("@") # host_or_ip@udp_port
                 address = (host, int(port))
             else:
                 address = args.syslog # /path/to/socket

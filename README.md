@@ -36,7 +36,7 @@ Whenever a bind9 zone notification is detected in the source feed, fetch zone co
         --syslog [TARGET]
             logs to syslog instead of stderr
             TARGET defaults to '/dev/log' (syslog's unix socket input)
-            set TARGET to hostname:udpport to log on a networked syslog
+            set TARGET to host_or_ip@udp_port for a networked syslog
 
         --server HOST
             dns server to transfer zones from
