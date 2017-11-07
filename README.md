@@ -129,9 +129,10 @@ To run a given command after every zone save, use `-c` :
 
 The following arguments are provided :
 
-- ARG1 : saved zone file path (including `--destination`)
-- ARG2 : zone name
-- ARG3 : saved zone serial
+- ARG1 : destination directory (from `--destination`)
+- ARG2 : saved zone file path (including `--destination`)
+- ARG3 : zone name
+- ARG4 : saved zone serial
 
 Remark:
 
@@ -218,7 +219,7 @@ Install a systemd service unit (remove `-k` if you do not use it) :
     User=${BNZD_USER}
     Group=${BNZD_USER}
     Restart=on-failure
-    ExecStart=${BNZD_BIN}/venv/bin/python3 ${BNZD_BIN}/bnzd.py -d ${BNZD_DATA} -l info -j _SYSTEMD_UNIT=bind9.service -k ${BNZD_DATA}/tsig.key -m -c '${BNZD_BIN}/tools/git-commit-hook.sh ${BNZD_DATA}'
+    ExecStart=${BNZD_BIN}/venv/bin/python3 ${BNZD_BIN}/bnzd.py -d ${BNZD_DATA} -l info -j _SYSTEMD_UNIT=bind9.service -k ${BNZD_DATA}/tsig.key -m -c ${BNZD_BIN}/tools/git-commit-hook.sh
 
     [Install]
     WantedBy=multi-user.target

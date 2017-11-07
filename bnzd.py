@@ -141,6 +141,7 @@ class ZoneInfo:
         self.dnssec = dnssec
         self.data = None
         self.saved_file_path = None
+        self.output_dir_path = None
 
     def __repr__(self):
         return "ZoneInfo: name={0} serial={1} dnssec={2}".format(self.name, self.serial, self.dnssec)
@@ -185,6 +186,13 @@ class ZoneInfo:
 
     def set_saved_file_path(self, file_path):
         self.saved_file_path = file_path
+
+    def set_output_dir_path(self, output_dir_path):
+        self.output_dir_path = output_dir_path
+
+    def get_output_dir_path(self):
+        return self.output_dir_path
+
 
 class BaseThread(threading.Thread):
 
@@ -519,6 +527,7 @@ class ZoneWriterThread(TransformingThread):
         with open(target_file, 'wb') as file_obj:
             file_obj.write(zone_info.get_data())
         zone_info.set_saved_file_path(target_file)
+        zone_info.set_output_dir_path(self.output_dir_path)
 
     def run_step(self):
         # get an item to process
@@ -548,7 +557,7 @@ class PostProcessingThread(ConsumingThread):
         else:
             stream = None
         # exec
-        command = "{0} {1} {2} {3}".format(self.external_command, zone_info.get_saved_file_path(), zone_info.name, zone_info.serial)
+        command = "{0} {1} {2} {3} {4}".format(self.external_command, zone_info.get_output_dir_path(), zone_info.get_saved_file_path(), zone_info.name, zone_info.serial)
         logging.debug("Running command with timeout {0} : {1}".format(self.external_timeout, command))
         result = subprocess.run(command, timeout=self.external_timeout, shell=True, stdin=stream, stdout=stream, stderr=stream)
         # result
