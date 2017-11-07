@@ -73,7 +73,7 @@ class Tsig:
 class ZoneInfo:
 
     # message filter information
-    RE_NOTIFY=re.compile(r'^zone ([^\s]+)/IN( \(signed\)|): sending notifies \(serial ([\d]+)\)$')
+    RE_NOTIFY=re.compile(r'zone ([^\s]+)/IN( \(signed\)|): sending notifies \(serial ([\d]+)\)$')
     RE_NOTIFY_ZONE=1
     RE_NOTIFY_DNSSEC=2
     RE_NOTIFY_SERIAL=3
@@ -115,7 +115,7 @@ class ZoneInfo:
     @classmethod
     def factory(cls, message):
         # filter and keep only notify message
-        m = cls.RE_NOTIFY.fullmatch(message)
+        m = cls.RE_NOTIFY.search(message)
         if not m:
             # logging.debug("Message is not a notify : {0}".format(message))
             return None
